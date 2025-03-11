@@ -6,6 +6,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <netinet/in.h>
@@ -42,6 +43,29 @@ int tun_create(char *dev_name) {
     return fd;
 }
 
+// Function to inspect and log IP packet details
+void log_ip_packet(unsigned char *buffer, int length) {
+	// Ensure packet meets min IP header length
+	if (length < 20) {
+		printf("IP packet length too short\n");
+		return;
+	}
+
+	// Get IP version (right shift 4 bits and mask) 
+	unsigned char version = (buffer[0] >> 4) &0xF;
+
+	// Extract IP protocol version
+	unsigned char ptcl = buffer[9];
+
+	// Extract and print source and dest addresses along with version,
+	// protocol, and packet length
+	printf("IPv%d Packet: %d.%d.%d.%d -> %d.%d.%d.%d (Protocol: %d, Length: %d)\n",
+		version,
+		buffer[12], buffer[13], buffer[14], buffer[15], // Source IP address
+		buffer[16], buffer[17], buffer[18], buffer[19],	// Dest IP address
+		ptcl, length);
+}
+
 int main (int argc, char* argv[ ])       // Two arguments needed: IP and port
 {
     // Declarations and definitions
@@ -69,6 +93,13 @@ int main (int argc, char* argv[ ])       // Two arguments needed: IP and port
         exit(1);
     }
     printf("TUN interface created successfully\n");
+    
+    // Set up IP address and bring up interface
+    char cmd[100];
+    sprintf(cmd, "ip addr add 10.0.0.2/24 dev %s", TUN_NAME);
+    system(cmd);
+    sprintf(cmd, "ip link set %s up", TUN_NAME);
+    system(cmd);
 
     // Populate socket address for the server
     printf("Populating server socket address..\n");
@@ -95,35 +126,57 @@ int main (int argc, char* argv[ ])       // Two arguments needed: IP and port
     else
         printf("Connected to the server..\n"); 
     
+    // Variables for select()
+    fd_set readfds;
+    struct timeval tv;
+    int maxfd = (sock > tun_fd) ? sock : tun_fd;
+
     // Main communication loop
     while(1) {
-        // Read from TUN interface
-        n = read(tun_fd, tun_buffer, MTU);
-        if (n > 0) {
-            // Get packet from TUN and send to server
-            printf("Received %d bytes from TUN\n", n);
-            send(sock, tun_buffer, n, 0);
-        }
-
-        // Reset variables before receiving
-        ptr = buffer;
-        memset(buffer, 0, sizeof(buffer));
-
-        // Receive response from the server..
-        printf("Waiting for server response..\n");
-        n = recv(sock, buffer, max_len, 0);
-        if(n <= 0) {
-            if(n < 0) {
-                printf("Error receiving data\n");
-            } else {
-                printf("Server disconnected\n");
-            }
+        // Set up file descriptors for select()
+        FD_ZERO(&readfds);
+        FD_SET(tun_fd, &readfds);
+        FD_SET(sock, &readfds);
+        
+        // Set timeout to 1 second
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        
+        // Wait for activity on any descriptor
+        int activity = select(maxfd + 1, &readfds, NULL, NULL, &tv);
+        
+        if (activity < 0) {
+            printf("Select error\n");
             break;
         }
-
-        // Write received data to TUN interface
-        printf("Writing %d bytes to TUN\n", n);
-        write(tun_fd, buffer, n);
+        
+        // Check for data from TUN interface
+        if (FD_ISSET(tun_fd, &readfds)) {
+            n = read(tun_fd, tun_buffer, MTU);
+            if (n > 0) {
+                log_ip_packet((unsigned char*)tun_buffer, n);
+                printf("Received %d bytes from TUN\n", n);
+                send(sock, tun_buffer, n, 0);
+            }
+        }
+        
+        // Check for data from server socket
+        if (FD_ISSET(sock, &readfds)) {
+            n = recv(sock, buffer, max_len, 0);
+            
+            if (n <= 0) {
+                if (n < 0) {
+                    printf("Error receiving data\n");
+                } else {
+                    printf("Server disconnected\n");
+                }
+                break;
+            }
+            
+            log_ip_packet((unsigned char*)buffer, n);
+            printf("Writing %d bytes to TUN\n", n);
+            write(tun_fd, buffer, n);
+        }
     }
 
     // Close socket and TUN interface
